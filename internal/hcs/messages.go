@@ -65,15 +65,17 @@ type TaskAssignment struct {
 
 // TaskResult is published back to the coordinator when a task completes.
 type TaskResult struct {
-	TaskID            string `json:"task_id"`
-	Status            string `json:"status"`
-	Output            string `json:"output,omitempty"`
-	DurationMs        int64  `json:"duration_ms,omitempty"`
-	TokensUsed        int    `json:"tokens_used,omitempty"`
-	StorageContentID  string `json:"storage_content_id,omitempty"`
-	INFTTokenID       string `json:"inft_token_id,omitempty"`
-	AuditSubmissionID string `json:"audit_submission_id,omitempty"`
-	Error             string `json:"error,omitempty"`
+	TaskID            string  `json:"task_id"`
+	Status            string  `json:"status"`
+	Output            string  `json:"output,omitempty"`
+	DurationMs        int64   `json:"duration_ms,omitempty"`
+	TokensUsed        int     `json:"tokens_used,omitempty"`
+	StorageContentID  string  `json:"storage_content_id,omitempty"`
+	INFTTokenID       string  `json:"inft_token_id,omitempty"`
+	AuditSubmissionID string  `json:"audit_submission_id,omitempty"`
+	Error             string  `json:"error,omitempty"`
+	SignalConfidence  float64 `json:"signal_confidence,omitempty"` // 0.0-1.0, for CRE Risk Router Gate 1
+	RiskScore         int     `json:"risk_score,omitempty"`        // 0-100, for CRE Risk Router Gate 2
 }
 
 // HealthStatus is published periodically to signal agent liveness.
