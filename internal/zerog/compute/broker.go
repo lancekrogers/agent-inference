@@ -12,7 +12,6 @@ import (
 	"bytes"
 	"context"
 	"crypto/ecdsa"
-	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -25,8 +24,6 @@ import (
 	"github.com/ethereum/go-ethereum/accounts/abi"
 	"github.com/ethereum/go-ethereum/accounts/abi/bind"
 	"github.com/ethereum/go-ethereum/common"
-	"github.com/ethereum/go-ethereum/common/hexutil"
-	"github.com/ethereum/go-ethereum/crypto"
 
 	"github.com/lancekrogers/agent-inference-ethden-2026/internal/zerog"
 )
@@ -124,6 +121,7 @@ type broker struct {
 	contract *bind.BoundContract
 	key      *ecdsa.PrivateKey
 	client   *http.Client
+	session  *sessionManager
 
 	mu        sync.RWMutex
 	models    []Model
@@ -145,6 +143,11 @@ func NewBroker(cfg BrokerConfig, backend zerog.ChainBackend, key *ecdsa.PrivateK
 	contractAddr := common.HexToAddress(cfg.ServingContractAddress)
 	bc := bind.NewBoundContract(contractAddr, servingABI, backend, backend, backend)
 
+	var sm *sessionManager
+	if key != nil {
+		sm = newSessionManager(key, backend, cfg.ChainID)
+	}
+
 	return &broker{
 		cfg:      cfg,
 		backend:  backend,
@@ -153,6 +156,7 @@ func NewBroker(cfg BrokerConfig, backend zerog.ChainBackend, key *ecdsa.PrivateK
 		client: &http.Client{
 			Timeout: 30 * time.Second,
 		},
+		session: sm,
 	}
 }
 
@@ -161,8 +165,8 @@ func (b *broker) SubmitJob(ctx context.Context, req JobRequest) (string, error) 
 		return "", fmt.Errorf("compute: context cancelled before submit: %w", err)
 	}
 
-	// Discover provider URL for the requested model
-	providerURL, err := b.resolveProvider(ctx, req.ModelID)
+	// Discover provider URL and address for the requested model
+	provider, err := b.resolveProvider(ctx, req.ModelID)
 	if err != nil {
 		return "", fmt.Errorf("compute: resolve provider for %s: %w", req.ModelID, err)
 	}
@@ -181,18 +185,18 @@ func (b *broker) SubmitJob(ctx context.Context, req JobRequest) (string, error) 
 		return "", fmt.Errorf("compute: marshal request: %w", err)
 	}
 
-	endpoint := providerURL + "/v1/proxy/chat/completions"
+	endpoint := provider.URL + "/v1/proxy/chat/completions"
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
 	if err != nil {
 		return "", fmt.Errorf("compute: create request: %w", err)
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
 
-	// Attach signed Bearer token for 0G session auth.
-	if b.key != nil {
-		token, tokenErr := b.buildAuthToken()
+	// Ensure on-chain session and get signed auth token.
+	if b.session != nil && provider.Address != "" {
+		token, tokenErr := b.session.EnsureSession(ctx, provider.Address)
 		if tokenErr != nil {
-			return "", fmt.Errorf("compute: build auth token: %w", tokenErr)
+			return "", fmt.Errorf("compute: ensure session: %w", tokenErr)
 		}
 		httpReq.Header.Set("Authorization", "Bearer "+token)
 	}
@@ -240,40 +244,31 @@ func (b *broker) SubmitJob(ctx context.Context, req JobRequest) (string, error) 
 	return chatResp.ID, nil
 }
 
-// buildAuthToken constructs a signed Bearer token for 0G Compute session auth.
-// Format: app-sk-<base64(timestamp:0xSignatureHex)>
-func (b *broker) buildAuthToken() (string, error) {
-	msg := fmt.Sprintf("%d", time.Now().Unix())
-	msgHash := crypto.Keccak256Hash([]byte(msg))
-
-	sig, err := crypto.Sign(msgHash.Bytes(), b.key)
-	if err != nil {
-		return "", fmt.Errorf("sign auth message: %w", err)
-	}
-
-	payload := fmt.Sprintf("%s:%s", msg, hexutil.Encode(sig))
-	token := "app-sk-" + base64.StdEncoding.EncodeToString([]byte(payload))
-	return token, nil
-}
-
-// doWithAuthRetry executes the HTTP request and retries once on 401
-// with a fresh auth token.
+// doWithAuthRetry executes the HTTP request. On 401, it invalidates the cached
+// session token and retries once with a fresh token.
 func (b *broker) doWithAuthRetry(ctx context.Context, req *http.Request, body []byte) (*http.Response, error) {
 	resp, err := b.client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("compute: provider request failed: %w", ErrBrokerDown)
 	}
 
-	if resp.StatusCode != http.StatusUnauthorized || b.key == nil {
+	if resp.StatusCode != http.StatusUnauthorized || b.session == nil {
 		return resp, nil
 	}
 
-	// 401 — refresh token and retry once.
+	// 401 — invalidate cached session and retry once.
 	resp.Body.Close()
+	b.session.invalidate()
 
-	token, tokenErr := b.buildAuthToken()
+	// Re-extract provider from the URL (stored during session setup)
+	providerAddr := b.session.cachedProvider
+	if providerAddr == "" {
+		return nil, fmt.Errorf("compute: no provider address for auth retry")
+	}
+
+	token, tokenErr := b.session.EnsureSession(ctx, providerAddr)
 	if tokenErr != nil {
-		return nil, fmt.Errorf("compute: refresh auth token: %w", tokenErr)
+		return nil, fmt.Errorf("compute: refresh session token: %w", tokenErr)
 	}
 
 	retryReq, err := http.NewRequestWithContext(ctx, req.Method, req.URL.String(), bytes.NewReader(body))
@@ -443,12 +438,18 @@ func (b *broker) listFromHTTP(ctx context.Context) ([]Model, error) {
 	return models, nil
 }
 
-func (b *broker) resolveProvider(ctx context.Context, modelID string) (string, error) {
+// providerInfo holds the resolved URL and on-chain address of a provider.
+type providerInfo struct {
+	URL     string
+	Address string
+}
+
+func (b *broker) resolveProvider(ctx context.Context, modelID string) (providerInfo, error) {
 	// Try cache first
 	if models := b.cachedModels(); models != nil {
 		for _, m := range models {
 			if m.ID == modelID && m.URL != "" {
-				return m.URL, nil
+				return providerInfo{URL: m.URL, Address: m.Provider}, nil
 			}
 		}
 	}
@@ -458,23 +459,23 @@ func (b *broker) resolveProvider(ctx context.Context, modelID string) (string, e
 	if err != nil {
 		// Last resort: use fallback endpoint
 		if b.cfg.Endpoint != "" {
-			return b.cfg.Endpoint, nil
+			return providerInfo{URL: b.cfg.Endpoint}, nil
 		}
-		return "", fmt.Errorf("no provider for model %s: %w", modelID, err)
+		return providerInfo{}, fmt.Errorf("no provider for model %s: %w", modelID, err)
 	}
 
 	for _, m := range models {
 		if m.ID == modelID && m.URL != "" {
-			return m.URL, nil
+			return providerInfo{URL: m.URL, Address: m.Provider}, nil
 		}
 	}
 
 	// If model not found but we have a fallback endpoint, use it
 	if b.cfg.Endpoint != "" {
-		return b.cfg.Endpoint, nil
+		return providerInfo{URL: b.cfg.Endpoint}, nil
 	}
 
-	return "", fmt.Errorf("no provider for model %s: %w", modelID, ErrNoModels)
+	return providerInfo{}, fmt.Errorf("no provider for model %s: %w", modelID, ErrNoModels)
 }
 
 func (b *broker) cachedModels() []Model {

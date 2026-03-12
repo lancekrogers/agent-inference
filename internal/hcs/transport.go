@@ -147,9 +147,12 @@ func (t *HCSTransport) subscribeOnce(
 	tid hiero.TopicID,
 	msgCh chan<- []byte,
 ) error {
+	// Start from 30 seconds ago to avoid replaying the entire topic history.
+	// This ensures we only process recent/new task assignments.
+	startTime := time.Now().Add(-30 * time.Second)
 	handle, err := hiero.NewTopicMessageQuery().
 		SetTopicID(tid).
-		SetStartTime(time.Unix(0, 0)).
+		SetStartTime(startTime).
 		Subscribe(t.client, func(message hiero.TopicMessage) {
 			data := append([]byte(nil), message.Contents...)
 			select {
