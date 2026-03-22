@@ -19,6 +19,7 @@ import (
 	"github.com/lancekrogers/agent-inference/internal/zerog/da"
 	"github.com/lancekrogers/agent-inference/internal/zerog/inft"
 	"github.com/lancekrogers/agent-inference/internal/zerog/storage"
+	"github.com/lancekrogers/agent-inference/internal/zerog/zgmock"
 )
 
 func main() {
@@ -35,25 +36,36 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
-	// Connect to 0G Chain
-	chainClient, err := zerog.DialClient(ctx, cfg.INFT.ChainRPC)
-	if err != nil {
-		log.Error("failed to connect to 0G Chain", "error", err)
-		os.Exit(1)
-	}
+	// Initialize 0G dependencies — mock or real based on ZG_MOCK_MODE.
+	var comp compute.ComputeBroker
+	var store storage.StorageClient
+	var mint inft.INFTMinter
+	var aud da.AuditPublisher
 
-	// Load signing key
-	chainKey, err := zerog.LoadKey(cfg.INFT.PrivateKey)
-	if err != nil {
-		log.Error("failed to load chain private key", "error", err)
-		os.Exit(1)
-	}
+	if os.Getenv("ZG_MOCK_MODE") == "true" {
+		log.Info("0G MOCK MODE ENABLED - no real 0G chain connections")
+		comp = zgmock.NewComputeBroker()
+		store = zgmock.NewStorageClient()
+		mint = zgmock.NewINFTMinter()
+		aud = zgmock.NewAuditPublisher()
+	} else {
+		chainClient, err := zerog.DialClient(ctx, cfg.INFT.ChainRPC)
+		if err != nil {
+			log.Error("failed to connect to 0G Chain", "error", err)
+			os.Exit(1)
+		}
 
-	// Initialize all dependencies with shared chain connection
-	comp := compute.NewBroker(cfg.Compute, chainClient, chainKey)
-	store := storage.NewClient(cfg.Storage, chainClient, chainKey)
-	mint := inft.NewMinter(cfg.INFT, chainClient, chainKey)
-	aud := da.NewPublisher(cfg.DA, chainClient, chainKey)
+		chainKey, err := zerog.LoadKey(cfg.INFT.PrivateKey)
+		if err != nil {
+			log.Error("failed to load chain private key", "error", err)
+			os.Exit(1)
+		}
+
+		comp = compute.NewBroker(cfg.Compute, chainClient, chainKey)
+		store = storage.NewClient(cfg.Storage, chainClient, chainKey)
+		mint = inft.NewMinter(cfg.INFT, chainClient, chainKey)
+		aud = da.NewPublisher(cfg.DA, chainClient, chainKey)
+	}
 
 	// Initialize HCS transport with Hedera SDK
 	transport := initHCSTransport(log)
